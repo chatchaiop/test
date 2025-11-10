@@ -819,13 +819,25 @@ int start() {
     
     if (NewOrdersPlaced && flag) {
         for (cnt = OrdersTotal() - 1; cnt >= 0; cnt--) {
-            OrderSelect(cnt, SELECT_BY_POS, MODE_TRADES);
+            if (!OrderSelect(cnt, SELECT_BY_POS, MODE_TRADES)) continue;
             if (OrderSymbol() != Symbol() || OrderMagicNumber() != MagicNumber) continue;
-            OrderModify(OrderTicket(), NormalizeDouble(AveragePrice, Digits), 
-                       NormalizeDouble(OrderStopLoss(), Digits), 
-                       NormalizeDouble(PriceTarget, Digits), 0, Yellow);
-            NewOrdersPlaced = FALSE;
+
+            double openPrice = NormalizeDouble(OrderOpenPrice(), Digits);
+            double currentSL = NormalizeDouble(OrderStopLoss(), Digits);
+            double currentTP = NormalizeDouble(OrderTakeProfit(), Digits);
+            double desiredSL = (config.stopLoss > 0.0) ? NormalizeDouble(Stopper, Digits) : currentSL;
+            double desiredTP = NormalizeDouble(PriceTarget, Digits);
+
+            bool updateSL = (config.stopLoss > 0.0) && (currentSL == 0.0 || MathAbs(desiredSL - currentSL) >= Point / 2.0);
+            bool updateTP = (currentTP == 0.0 || MathAbs(desiredTP - currentTP) >= Point / 2.0);
+
+            if (updateSL || updateTP) {
+                double finalSL = updateSL ? desiredSL : currentSL;
+                double finalTP = updateTP ? desiredTP : currentTP;
+                OrderModify(OrderTicket(), openPrice, finalSL, finalTP, 0, Yellow);
+            }
         }
+        NewOrdersPlaced = FALSE;
     }
     
     return 0;
