@@ -98,6 +98,11 @@ extern bool Speculatemode = FALSE;
 extern bool ALLinmode = FALSE;
 extern bool ONLYBUYMODE = TRUE;
 extern bool ONLYSELLMODE = FALSE;
+extern int MajorTrendMAPeriod = 200;
+extern double TrendBufferPoints = 10.0;
+extern int ADRPeriod = 30;
+extern double ADRBaselinePoints = 3000.0;
+extern double ADRInfluence = 0.6;
 
 //====== GLOBAL VARIABLES ======
 int MagicNumber = 123456;
@@ -115,6 +120,12 @@ double LastSellPrice = 0;
 double AveragePrice = 0;
 double Stopper = 0.0;
 int ticket = 0;
+int MajorTrendDirection = 0;
+int LastMajorTrendDirection = 0;
+bool AllowBuy = TRUE;
+bool AllowSell = TRUE;
+double BaseGridStep = 0.0;
+double AdaptiveGridStep = 0.0;
 
 // Indicator buffers
 double bitblack_1 = 10;
@@ -145,10 +156,12 @@ void SetLabelText(string name, string text, int size, color col) {
 
 //====== TRADING CONDITION HELPERS ======
 bool ShouldBlockBuy() {
+    if (!AllowBuy) return true;
     return (bitblack_4 > bitblack_5 - config.strs && LX == 0);
 }
 
 bool ShouldBlockSell() {
+    if (!AllowSell) return true;
     return (bitblack_4 - config.strs < bitblack_5 && LX == 0);
 }
 
@@ -159,6 +172,70 @@ int GetActiveMode() {
     if (Speculatemode) return 2;
     if (ALLinmode) return 3;
     return 1; // Default to Normal Mode
+}
+
+//====== TREND ANALYSIS ======
+int DetermineMajorTrend() {
+    double maH1 = iMA(NULL, PERIOD_H1, MajorTrendMAPeriod, 0, MODE_EMA, PRICE_CLOSE, 1);
+    double priceH1 = iClose(NULL, PERIOD_H1, 1);
+    double maH4 = iMA(NULL, PERIOD_H4, MajorTrendMAPeriod, 0, MODE_EMA, PRICE_CLOSE, 1);
+    double priceH4 = iClose(NULL, PERIOD_H4, 1);
+
+    int trendH1 = 0;
+    int trendH4 = 0;
+
+    if (priceH1 > maH1 + TrendBufferPoints * Point) trendH1 = 1;
+    else if (priceH1 < maH1 - TrendBufferPoints * Point) trendH1 = -1;
+
+    if (priceH4 > maH4 + TrendBufferPoints * Point) trendH4 = 1;
+    else if (priceH4 < maH4 - TrendBufferPoints * Point) trendH4 = -1;
+
+    if (trendH1 == trendH4) return trendH1;
+    if (trendH4 != 0) return trendH4;
+    return trendH1;
+}
+
+//====== AVERAGE DAILY RANGE ======
+double CalculateADRPoints(int period) {
+    double adr = iATR(NULL, PERIOD_D1, period, 1);
+    if (adr <= 0.0) return 0.0;
+    return adr / Point;
+}
+
+double ApplyADRScaling(double baseStep) {
+    double adrPoints = CalculateADRPoints(ADRPeriod);
+    if (adrPoints <= 0.0 || ADRBaselinePoints <= 0.0) return baseStep;
+
+    double factor = adrPoints / ADRBaselinePoints;
+    double adjustedFactor = 1.0 + (factor - 1.0) * ADRInfluence;
+    double minFactor = 0.7;
+    double maxFactor = 1.6;
+    if (adjustedFactor < minFactor) adjustedFactor = minFactor;
+    if (adjustedFactor > maxFactor) adjustedFactor = maxFactor;
+
+    double scaledStep = baseStep * adjustedFactor;
+    double minStep = baseStep * 0.6;
+    double maxStep = baseStep * 1.6;
+    if (scaledStep < minStep) scaledStep = minStep;
+    if (scaledStep > maxStep) scaledStep = maxStep;
+
+    return scaledStep;
+}
+
+double GetAdaptiveGridStep(int tradeIndex, double baseStep) {
+    if (baseStep <= 0.0) return 0.0;
+
+    if (tradeIndex <= 0) return baseStep * 1.3;
+    if (tradeIndex == 1) return baseStep * 1.2;
+
+    if (tradeIndex <= 4) {
+        double multipliers[3] = {1.0, 0.95, 0.9};
+        return baseStep * multipliers[tradeIndex - 2];
+    }
+
+    double laterMultiplier = 1.05 + MathMin(0.1, (tradeIndex - 5) * 0.02);
+    if (laterMultiplier > 1.2) laterMultiplier = 1.2;
+    return baseStep * laterMultiplier;
 }
 
 string GetModeName(int mode) {
@@ -543,40 +620,68 @@ int start() {
     
     // Display current mode
     CreateLabelSimple("ModeLabel", 300, 10, modeName, 20, Lime);
-    
+
     // Close based on profit levels
     double currentProfit = CalculateProfit();
+    double iLots = 0.0;
+    total = CountTrades();
+
     if (currentProfit >= 100) {
         CloseThisSymbolAll();
         return 0;
     }
-    
+
     if (currentProfit <= -1000 && total == 3) CloseThisSymbolAll();
     if (currentProfit <= -6000 && total == 2) CloseThisSymbolAll();
     if (currentProfit <= -3000 && total == 5) CloseThisSymbolAll();
     if (currentProfit <= -10000 && total == 6) CloseThisSymbolAll();
-    
-    // Dynamic pips calculation
+
+    // Determine major trend and trading permissions
+    MajorTrendDirection = DetermineMajorTrend();
+    AllowBuy = !ONLYSELLMODE;
+    AllowSell = !ONLYBUYMODE;
+    if (MajorTrendDirection == 1) AllowSell = false;
+    else if (MajorTrendDirection == -1) AllowBuy = false;
+
+    if (LastMajorTrendDirection != 0 && MajorTrendDirection != 0 &&
+        MajorTrendDirection != LastMajorTrendDirection && total > 0 && total < 4) {
+        CloseThisSymbolAll();
+        LongTrade = FALSE;
+        ShortTrade = FALSE;
+        TradeNow = FALSE;
+        LastMajorTrendDirection = MajorTrendDirection;
+        return 0;
+    }
+
+    // Dynamic pips calculation with ADR adjustment
+    double rawStep = DefaultPips;
     if (DynamicPips) {
         double hival = High[iHighest(NULL, 0, MODE_HIGH, Glubina, 1)];
         double loval = Low[iLowest(NULL, 0, MODE_LOW, Glubina, 1)];
-        PipStep = NormalizeDouble((hival - loval) / DEL / Point, 0);
-        if (PipStep < DefaultPips / DEL) PipStep = NormalizeDouble(DefaultPips / DEL, 0);
-        if (PipStep > DefaultPips * DEL) PipStep = NormalizeDouble(DefaultPips * DEL, 0);
+        rawStep = (hival - loval) / DEL / Point;
+        if (rawStep < DefaultPips / DEL) rawStep = DefaultPips / DEL;
+        if (rawStep > DefaultPips * DEL) rawStep = DefaultPips * DEL;
     }
-    
+
+    if (rawStep <= 0.0) rawStep = DefaultPips;
+    BaseGridStep = NormalizeDouble(ApplyADRScaling(rawStep), 2);
+    if (BaseGridStep <= 0.0) BaseGridStep = DefaultPips;
+    AdaptiveGridStep = NormalizeDouble(GetAdaptiveGridStep(total, BaseGridStep), 2);
+    if (AdaptiveGridStep <= 0.0) AdaptiveGridStep = BaseGridStep;
+    PipStep = (int)NormalizeDouble(AdaptiveGridStep, 0);
+
     // Time filtering
     if (UseTrailingStop) TrailingAlls(TrailStart, TrailStop, AveragePrice);
-    
-    if (UseTimeOut && ((iCCI(NULL, 15, 55, 0, 0) > 1000000 && ShortTrade) || 
+
+    if (UseTimeOut && ((iCCI(NULL, 15, 55, 0, 0) > 1000000 && ShortTrade) ||
         (iCCI(NULL, 15, 55, 0, 0) < -1000000 && LongTrade))) {
         CloseThisSymbolAll();
         return 0;
     }
-    
+
     if (timeprev == Time[0]) return 0;
     timeprev = Time[0];
-    
+
     // Equity stop loss
     currentProfit = CalculateProfit();
     if (UseEquityStop) {
@@ -585,7 +690,7 @@ int start() {
             return 0;
         }
     }
-    
+
     total = CountTrades();
     if (total == 0) flag = FALSE;
     
@@ -611,44 +716,46 @@ int start() {
         RefreshRates();
         LastBuyPrice = FindLastBuyPrice();
         LastSellPrice = FindLastSellPrice();
-        if (LongTrade && LastBuyPrice - Ask >= PipStep * Point) TradeNow = TRUE;
-        if (ShortTrade && Bid - LastSellPrice >= PipStep * Point) TradeNow = TRUE;
+        if (LongTrade && AllowBuy && LastBuyPrice - Ask >= AdaptiveGridStep * Point) TradeNow = TRUE;
+        if (ShortTrade && AllowSell && Bid - LastSellPrice >= AdaptiveGridStep * Point) TradeNow = TRUE;
     }
-    
+
     // Open new series
     if (total < 1) {
         ShortTrade = FALSE;
         LongTrade = FALSE;
-        TradeNow = TRUE;
+        TradeNow = (AllowBuy || AllowSell);
     }
-    
+
     // Execute trades
     if (TradeNow) {
         LastBuyPrice = FindLastBuyPrice();
         LastSellPrice = FindLastSellPrice();
-        
-        if (ShortTrade) {
+
+        if (ShortTrade && AllowSell) {
             NumOfTrades = total;
-            double iLots = NormalizeDouble(Lots * MathPow(LotExponent, NumOfTrades), 2);
+            iLots = NormalizeDouble(Lots * MathPow(LotExponent, NumOfTrades), 2);
             RefreshRates();
-            ticket = OpenPendingOrder(1, iLots, Bid, MaxSlippage, Ask, 0, 0, 
-                                      EAName + "-" + NumOfTrades + "-" + PipStep, MagicNumber, 0, HotPink);
+            string sellComment = EAName + "-" + NumOfTrades + "-" + DoubleToStr(AdaptiveGridStep, 1);
+            ticket = OpenPendingOrder(1, iLots, Bid, MaxSlippage, Ask, 0, 0,
+                                      sellComment, MagicNumber, 0, HotPink);
             if (ticket < 0) return 0;
             LastSellPrice = FindLastSellPrice();
             TradeNow = FALSE;
             NewOrdersPlaced = TRUE;
-        } else if (LongTrade) {
+        } else if (LongTrade && AllowBuy) {
             NumOfTrades = total;
             iLots = NormalizeDouble(Lots * MathPow(LotExponent, NumOfTrades), 2);
-            ticket = OpenPendingOrder(0, iLots, Ask, MaxSlippage, Bid, 0, 0, 
-                                      EAName + "-" + NumOfTrades + "-" + PipStep, MagicNumber, 0, Lime);
+            string buyComment = EAName + "-" + NumOfTrades + "-" + DoubleToStr(AdaptiveGridStep, 1);
+            ticket = OpenPendingOrder(0, iLots, Ask, MaxSlippage, Bid, 0, 0,
+                                      buyComment, MagicNumber, 0, Lime);
             if (ticket < 0) return 0;
             LastBuyPrice = FindLastBuyPrice();
             TradeNow = FALSE;
             NewOrdersPlaced = TRUE;
         }
     }
-    
+
     // Open first trades
     if (TradeNow && total < 1) {
         double PrevCl = iClose(Symbol(), 0, 2);
@@ -659,14 +766,14 @@ int start() {
              iLots = NormalizeDouble(Lots * MathPow(LotExponent, NumOfTrades), 2);
             
             if (PrevCl > CurrCl) {
-                if (iRSI(NULL, PERIOD_M1, 14, PRICE_CLOSE, 1) < config.rsiMaximum) {
-                    ticket = OpenPendingOrder(1, iLots, Bid, MaxSlippage, Bid, 0, 0, 
+                if (AllowSell && iRSI(NULL, PERIOD_M1, 14, PRICE_CLOSE, 1) < config.rsiMaximum) {
+                    ticket = OpenPendingOrder(1, iLots, Bid, MaxSlippage, Bid, 0, 0,
                                               EAName + "-" + NumOfTrades, MagicNumber, 0, HotPink);
                     if (ticket > 0) NewOrdersPlaced = TRUE;
                 }
             } else {
-                if (iRSI(NULL, PERIOD_M1, 14, PRICE_CLOSE, 1) > config.rsiMinimum) {
-                    ticket = OpenPendingOrder(0, iLots, Ask, MaxSlippage, Ask, 0, 0, 
+                if (AllowBuy && iRSI(NULL, PERIOD_M1, 14, PRICE_CLOSE, 1) > config.rsiMinimum) {
+                    ticket = OpenPendingOrder(0, iLots, Ask, MaxSlippage, Ask, 0, 0,
                                               EAName + "-" + NumOfTrades, MagicNumber, 0, Lime);
                     if (ticket > 0) NewOrdersPlaced = TRUE;
                 }
@@ -674,6 +781,8 @@ int start() {
             TradeNow = FALSE;
         }
     }
+
+    LastMajorTrendDirection = MajorTrendDirection;
     
     // Calculate average price and update TP/SL
     total = CountTrades();
@@ -689,13 +798,14 @@ int start() {
     }
     if (total > 0) AveragePrice = NormalizeDouble(AveragePrice / Count, Digits);
     
+    double PriceTarget = 0.0;
     if (NewOrdersPlaced) {
         for (cnt = OrdersTotal() - 1; cnt >= 0; cnt--) {
             OrderSelect(cnt, SELECT_BY_POS, MODE_TRADES);
             if (OrderSymbol() != Symbol() || OrderMagicNumber() != MagicNumber) continue;
-            
+
             if (OrderType() == OP_BUY) {
-                double PriceTarget = AveragePrice + config.takeProfit * Point;
+                PriceTarget = AveragePrice + config.takeProfit * Point;
                 Stopper = AveragePrice - config.stopLoss * Point;
                 flag = TRUE;
             }
@@ -709,13 +819,25 @@ int start() {
     
     if (NewOrdersPlaced && flag) {
         for (cnt = OrdersTotal() - 1; cnt >= 0; cnt--) {
-            OrderSelect(cnt, SELECT_BY_POS, MODE_TRADES);
+            if (!OrderSelect(cnt, SELECT_BY_POS, MODE_TRADES)) continue;
             if (OrderSymbol() != Symbol() || OrderMagicNumber() != MagicNumber) continue;
-            OrderModify(OrderTicket(), NormalizeDouble(AveragePrice, Digits), 
-                       NormalizeDouble(OrderStopLoss(), Digits), 
-                       NormalizeDouble(PriceTarget, Digits), 0, Yellow);
-            NewOrdersPlaced = FALSE;
+
+            double openPrice = NormalizeDouble(OrderOpenPrice(), Digits);
+            double currentSL = NormalizeDouble(OrderStopLoss(), Digits);
+            double currentTP = NormalizeDouble(OrderTakeProfit(), Digits);
+            double desiredSL = (config.stopLoss > 0.0) ? NormalizeDouble(Stopper, Digits) : currentSL;
+            double desiredTP = NormalizeDouble(PriceTarget, Digits);
+
+            bool updateSL = (config.stopLoss > 0.0) && (currentSL == 0.0 || MathAbs(desiredSL - currentSL) >= Point / 2.0);
+            bool updateTP = (currentTP == 0.0 || MathAbs(desiredTP - currentTP) >= Point / 2.0);
+
+            if (updateSL || updateTP) {
+                double finalSL = updateSL ? desiredSL : currentSL;
+                double finalTP = updateTP ? desiredTP : currentTP;
+                OrderModify(OrderTicket(), openPrice, finalSL, finalTP, 0, Yellow);
+            }
         }
+        NewOrdersPlaced = FALSE;
     }
     
     return 0;
